@@ -357,6 +357,79 @@ def evaluar_cercania(cercania):
     return "Lejana"
 
 
+
+def formato_objetivo(nombre: str) -> str:
+    return {
+        "precio_real_cfr_bbl": "CFR por barril",
+        "precio_real_cif_bbl": "CIF por barril",
+        "precio_real_fob_bbl": "FOB por barril",
+    }.get(nombre, nombre)
+
+
+def texto_interpretacion_prediccion(pred_texto: str, prob: float, fecha_base, periodo_predicho) -> str:
+    tendencia = "un incremento" if pred_texto == "Sube" else "que no se presentaría un incremento"
+    return (
+        f"Con la información EIA disponible al {pd.to_datetime(fecha_base).date()}, "
+        f"el modelo estima {tendencia} para el periodo {pd.to_datetime(periodo_predicho).date()}. "
+        f"La probabilidad estimada de subida es {prob:.2%}. "
+        "El umbral de decisión utilizado es 50%; por encima de ese nivel se clasifica como 'Sube' y por debajo como 'No sube'."
+    )
+
+
+def texto_interpretacion_recope(producto: str, objetivo: str, n: int) -> str:
+    return (
+        f"Esta sección resume las compras reales de importación disponibles para el producto seleccionado ({producto}). "
+        f"El precio real utilizado para el contraste es {formato_objetivo(objetivo)}. "
+        f"La base contiene {n:,} registros limpios para análisis, luego de convertir fechas, montos y volúmenes a formato numérico."
+    )
+
+
+def texto_interpretacion_comparacion(ultimo: pd.Series, etiqueta_eia: str) -> str:
+    cercania = float(ultimo["cercania_pct"])
+    dif = float(ultimo["diferencia_usd_bbl"])
+    sentido = "mayor" if dif > 0 else "menor"
+    return (
+        f"Para la última observación cruzada, el precio real Recope fue {sentido} que el proxy internacional por "
+        f"{abs(dif):,.2f} USD/bbl. La cercanía calculada fue de {cercania:,.2f}%. "
+        f"El proxy usado es {etiqueta_eia}. Esta comparación debe leerse como una medida de aproximación de mercado, "
+        "no como una liquidación tarifaria ni como una validación contractual de una compra específica."
+    )
+
+
+def texto_analisis_tecnico(backtest: pd.DataFrame) -> str:
+    if backtest.empty:
+        return "No hay observaciones suficientes para construir una interpretación técnica del contraste."
+    cerc = backtest["cercania_pct"].mean()
+    mape = backtest["error_pct"].mean()
+    mae = backtest["error_abs_usd_bbl"].mean()
+    if cerc >= 90:
+        nivel = "alta"
+    elif cerc >= 75:
+        nivel = "moderada"
+    else:
+        nivel = "limitada"
+    return (
+        f"El contraste histórico muestra una cercanía promedio de {cerc:,.2f}%, con un MAE de {mae:,.2f} USD/bbl "
+        f"y un MAPE de {mape:,.2f}%. En términos prácticos, la capacidad del proxy para aproximar las compras reales es {nivel}. "
+        "Las diferencias pueden explicarse por rezagos temporales entre mercado y compra, condiciones comerciales, fletes, seguros, "
+        "márgenes de intermediación, composición del producto, puntos de entrega y otros componentes que no necesariamente están contenidos en la serie EIA."
+    )
+
+
+def pie_autor():
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style='text-align:center; color:#6b7280; font-size:14px; line-height:1.6;'>
+        Modelo experimental de análisis y predicción de precios de combustibles.<br>
+        Datos públicos EIA y contraste con compras reales de importación.<br><br>
+        <b>Hecho por: Lic. Juan Carlos Mena</b>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 with st.sidebar:
     st.header("Opciones")
     st.write("Presioná el botón para descargar datos EIA, entrenar el modelo y generar la predicción.")
@@ -367,13 +440,13 @@ with st.sidebar:
     producto_recope = st.selectbox(
         "Producto para contraste",
         ["gasolina_regular", "gasolina_super", "diesel", "jet", "glp", "asfalto", "avgas", "bunker"],
-        index=2,
+        index=1,
     )
     objetivo_recope = st.selectbox(
         "Precio real Recope",
         ["precio_real_cfr_bbl", "precio_real_cif_bbl", "precio_real_fob_bbl"],
         index=0,
-        help="CFR se usa por defecto porque aproxima mejor FOB + flete. CIF y FOB quedan disponibles para análisis."
+        help="CFR se usa por defecto porque aproxima FOB + flete. CIF y FOB quedan disponibles para análisis."
     )
     st.divider()
     st.caption("Fuente EIA: archivos históricos públicos. Fuente Recope: CSV suministrado por el usuario.")
@@ -386,55 +459,107 @@ if ejecutar:
 
     pred_texto = "Sube" if salida["pred_final"] == 1 else "No sube"
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Última fecha EIA", str(salida["fecha_base"].date()))
-    col2.metric("Periodo predicho", str(salida["periodo_predicho"].date()))
-    col3.metric("Predicción", pred_texto)
-    col4.metric("Probabilidad de subida", f"{salida['prob_final']:.2%}")
-
-    # -------------------------------------------------------------------------
-    # Nuevo módulo: contraste con compras reales Recope.
-    # -------------------------------------------------------------------------
-    st.subheader("Contraste con compras reales Recope")
     try:
         df_recope = cargar_compras_recope(archivo_recope if archivo_recope is not None else None)
     except Exception as exc:
         df_recope = pd.DataFrame()
-        st.error(f"No fue posible cargar el CSV de compras Recope: {exc}")
-
-    if df_recope.empty:
-        st.info("No se encontró un CSV de compras Recope. Cargá el archivo en la barra lateral o colocá 2016-2026_abril.csv en la carpeta del proyecto.")
+        error_recope = str(exc)
     else:
+        error_recope = None
+
+    if not df_recope.empty:
         backtest, etiqueta_eia = construir_backtesting_recope(df, df_recope, producto_recope, objetivo_recope)
+    else:
+        backtest, etiqueta_eia = pd.DataFrame(), "Sin proxy disponible"
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "1. Predicción EIA",
+        "2. Compras Recope",
+        "3. Comparación",
+        "4. Análisis técnico",
+        "5. Histórico y detalles",
+    ])
+
+    with tab1:
+        st.header("Predicción con datos EIA")
+        st.caption("Esta sección muestra la predicción del siguiente periodo utilizando datos históricos públicos de EIA.")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Última fecha EIA", str(salida["fecha_base"].date()))
+        col2.metric("Periodo predicho", str(salida["periodo_predicho"].date()))
+        col3.metric("Predicción", pred_texto)
+        col4.metric("Probabilidad de subida", f"{salida['prob_final']:.2%}")
+
+        st.info(texto_interpretacion_prediccion(pred_texto, salida["prob_final"], salida["fecha_base"], salida["periodo_predicho"]))
+
+        st.subheader("Evaluación resumida del modelo")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Accuracy test temporal", f"{salida['accuracy']:.2%}")
+        c2.metric("Promedio validación cruzada", f"{salida['cv_scores'].mean():.2%}")
+        c3.metric("Frecuencia detectada", str(salida["frecuencia"]))
+
+        st.markdown(
+            """
+            **Cómo leer esta sección:**  
+            El modelo clasifica si la referencia internacional sube o no sube en el siguiente periodo semanal. 
+            La probabilidad de subida no es un precio, sino la confianza relativa del clasificador respecto a la clase 'Sube'.
+            """
+        )
+
+    with tab2:
+        st.header("Compras reales de importación Recope")
+        st.caption("Esta sección revisa la información real de compras disponible en el CSV suministrado.")
+        if error_recope:
+            st.error(f"No fue posible cargar el CSV de compras Recope: {error_recope}")
+        elif df_recope.empty:
+            st.warning("No se encontró un CSV de compras Recope. Cargá el archivo en la barra lateral o colocá 2016-2026_abril.csv en la carpeta del proyecto.")
+        else:
+            st.info(texto_interpretacion_recope(producto_recope, objetivo_recope, len(df_recope)))
+            base_prod = df_recope[df_recope["producto_normalizado"] == producto_recope].copy()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Registros del producto", f"{len(base_prod):,.0f}")
+            c2.metric("Barriles acumulados", f"{base_prod['barriles'].sum():,.0f}")
+            c3.metric("Primera compra", str(base_prod["fecha_operacion"].min().date()) if not base_prod.empty else "-")
+            c4.metric("Última compra", str(base_prod["fecha_operacion"].max().date()) if not base_prod.empty else "-")
+
+            if not base_prod.empty:
+                serie = agregar_compras_periodo(df_recope, producto_recope)
+                precio_col = objetivo_recope
+                fig_compra = px.line(
+                    serie,
+                    x="fecha",
+                    y=precio_col,
+                    title=f"Precio real Recope - {producto_recope} ({formato_objetivo(objetivo_recope)})",
+                    labels={precio_col: "USD/bbl", "fecha": "Fecha"},
+                )
+                st.plotly_chart(fig_compra, use_container_width=True)
+                with st.expander("Ver muestra de compras normalizadas"):
+                    cols = [c for c in ["fecha_operacion", "producto", "producto_normalizado", "barriles", "precio_fob_bbl", "precio_cif_bbl", "precio_cfr_bbl", "proveedor"] if c in base_prod.columns]
+                    st.dataframe(base_prod[cols].sort_values("fecha_operacion", ascending=False).head(100), use_container_width=True)
+
+    with tab3:
+        st.header("Comparación entre proxy EIA y compras Recope")
+        st.caption("Esta sección mide qué tan cerca está el proxy de mercado EIA del precio real de importación observado.")
         if backtest.empty:
             st.warning("No hay datos suficientes para cruzar el producto seleccionado contra la serie EIA.")
         else:
             ultimo = backtest.iloc[-1]
             c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Última compra Recope", str(pd.to_datetime(ultimo["fecha"]).date()))
+            c1.metric("Última compra cruzada", str(pd.to_datetime(ultimo["fecha"]).date()))
             c2.metric("Proxy EIA", f"{ultimo['precio_eia_bbl']:,.2f} USD/bbl")
             c3.metric("Precio real Recope", f"{ultimo['precio_real_bbl']:,.2f} USD/bbl")
             c4.metric("Diferencia", f"{ultimo['diferencia_usd_bbl']:,.2f} USD/bbl")
             c5.metric("Cercanía", f"{ultimo['cercania_pct']:,.2f}%")
 
             evaluacion = evaluar_cercania(ultimo["cercania_pct"])
+            mensaje_eval = f"Evaluación de la última compra: {evaluacion}"
             if ultimo["cercania_pct"] >= 95:
-                st.success(f"Evaluación de la última compra: {evaluacion}")
+                st.success(mensaje_eval)
             elif ultimo["cercania_pct"] >= 90:
-                st.warning(f"Evaluación de la última compra: {evaluacion}")
+                st.warning(mensaje_eval)
             else:
-                st.error(f"Evaluación de la última compra: {evaluacion}")
+                st.error(mensaje_eval)
 
-            st.caption(
-                f"Comparación contra {etiqueta_eia}. La cercanía se calcula como 100 - error porcentual absoluto. "
-                "Este bloque mide cercanía contra un proxy EIA; no sustituye una liquidación tarifaria ni una comparación contractual detallada."
-            )
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Cercanía histórica promedio", f"{backtest['cercania_pct'].mean():,.2f}%")
-            m2.metric("MAE", f"{backtest['error_abs_usd_bbl'].mean():,.2f} USD/bbl")
-            m3.metric("MAPE", f"{backtest['error_pct'].mean():,.2f}%")
-            m4.metric("Observaciones cruzadas", f"{len(backtest):,.0f}")
+            st.info(texto_interpretacion_comparacion(ultimo, etiqueta_eia))
 
             graf = backtest[["fecha", "precio_eia_bbl", "precio_real_bbl"]].melt(
                 id_vars="fecha",
@@ -447,49 +572,107 @@ if ejecutar:
                 x="fecha",
                 y="USD/bbl",
                 color="serie",
-                title=f"Precio proxy EIA vs compra real Recope - {producto_recope}"
+                title=f"Proxy EIA vs compra real Recope - {producto_recope}"
             )
             st.plotly_chart(fig_recope, use_container_width=True)
 
-            with st.expander("Ver detalle del contraste Recope"):
-                st.dataframe(backtest.sort_values("fecha", ascending=False), use_container_width=True)
-                st.download_button(
-                    "Descargar contraste Recope CSV",
-                    backtest.to_csv(index=False),
-                    file_name=f"contraste_recope_{producto_recope}.csv",
-                    mime="text/csv"
-                )
+            st.markdown(
+                """
+                **Nota de lectura:**  
+                La cercanía se calcula como `100 - error porcentual absoluto`. 
+                Un valor alto indica que el proxy y el precio real están próximos; un valor bajo indica una brecha importante que requiere análisis de composición, logística o temporalidad.
+                """
+            )
 
-    st.subheader("Evaluación del modelo")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Accuracy test temporal", f"{salida['accuracy']:.2%}")
-    c2.metric("Promedio validación cruzada", f"{salida['cv_scores'].mean():.2%}")
-    c3.metric("Frecuencia detectada", str(salida["frecuencia"]))
+    with tab4:
+        st.header("Análisis técnico e interpretación")
+        st.caption("Esta sección transforma las métricas en una lectura técnica para el usuario final.")
+        if backtest.empty:
+            st.warning("No hay observaciones suficientes para el análisis técnico del contraste Recope.")
+        else:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Cercanía histórica promedio", f"{backtest['cercania_pct'].mean():,.2f}%")
+            m2.metric("MAE", f"{backtest['error_abs_usd_bbl'].mean():,.2f} USD/bbl")
+            m3.metric("MAPE", f"{backtest['error_pct'].mean():,.2f}%")
+            m4.metric("Observaciones cruzadas", f"{len(backtest):,.0f}")
 
-    st.write("Mejores hiperparámetros:", salida["mejores_parametros"])
+            st.info(texto_analisis_tecnico(backtest))
 
-    st.subheader("Matriz de confusión")
-    matriz_df = pd.DataFrame(salida["matriz"], index=["Real: No sube", "Real: Sube"], columns=["Pred: No sube", "Pred: Sube"])
-    st.dataframe(matriz_df, use_container_width=True)
+            st.subheader("Distribución de errores")
+            fig_err = px.histogram(
+                backtest,
+                x="diferencia_usd_bbl",
+                nbins=40,
+                title="Distribución de diferencias: Recope - proxy EIA",
+                labels={"diferencia_usd_bbl": "Diferencia USD/bbl"},
+            )
+            st.plotly_chart(fig_err, use_container_width=True)
 
-    st.subheader("Resultados del periodo de prueba")
-    st.dataframe(salida["resultados"].sort_values("fecha", ascending=False), use_container_width=True)
+            st.subheader("Cercanía histórica")
+            fig_cerc = px.line(
+                backtest,
+                x="fecha",
+                y="cercania_pct",
+                title="Cercanía porcentual por periodo",
+                labels={"cercania_pct": "Cercanía (%)", "fecha": "Fecha"},
+            )
+            fig_cerc.add_hline(y=90, line_dash="dash")
+            st.plotly_chart(fig_cerc, use_container_width=True)
 
-    fig = px.line(salida["resultados"], x="fecha", y="probabilidad_sube", title="Probabilidad estimada de subida en el periodo de prueba")
-    fig.add_hline(y=0.5, line_dash="dash")
-    st.plotly_chart(fig, use_container_width=True)
+    with tab5:
+        st.header("Histórico, matriz y datos técnicos")
+        st.caption("Esta sección conserva los detalles del modelo para auditoría, revisión y descarga.")
 
-    st.subheader("Histórico de predicciones")
-    st.dataframe(historico.sort_values("fecha_ejecucion", ascending=False), use_container_width=True)
+        st.subheader("Matriz de confusión")
+        matriz_df = pd.DataFrame(salida["matriz"], index=["Real: No sube", "Real: Sube"], columns=["Pred: No sube", "Pred: Sube"])
+        st.dataframe(matriz_df, use_container_width=True)
 
-    st.download_button(
-        "Descargar histórico CSV",
-        historico.to_csv(index=False),
-        file_name="historico_predicciones_combustibles.csv",
-        mime="text/csv"
-    )
+        st.subheader("Mejores hiperparámetros")
+        st.json(salida["mejores_parametros"])
 
-    st.subheader("Últimos datos descargados")
-    st.dataframe(df.tail(15).sort_values("fecha", ascending=False), use_container_width=True)
+        st.subheader("Resultados del periodo de prueba")
+        st.dataframe(salida["resultados"].sort_values("fecha", ascending=False), use_container_width=True)
+
+        fig = px.line(salida["resultados"], x="fecha", y="probabilidad_sube", title="Probabilidad estimada de subida en el periodo de prueba")
+        fig.add_hline(y=0.5, line_dash="dash")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Histórico de predicciones")
+        st.dataframe(historico.sort_values("fecha_ejecucion", ascending=False), use_container_width=True)
+        st.download_button(
+            "Descargar histórico CSV",
+            historico.to_csv(index=False),
+            file_name="historico_predicciones_combustibles.csv",
+            mime="text/csv"
+        )
+
+        if not backtest.empty:
+            st.subheader("Detalle del contraste Recope")
+            st.dataframe(backtest.sort_values("fecha", ascending=False), use_container_width=True)
+            st.download_button(
+                "Descargar contraste Recope CSV",
+                backtest.to_csv(index=False),
+                file_name=f"contraste_recope_{producto_recope}.csv",
+                mime="text/csv"
+            )
+
+        st.subheader("Últimos datos EIA descargados")
+        st.dataframe(df.tail(15).sort_values("fecha", ascending=False), use_container_width=True)
+
+    pie_autor()
 else:
     st.info("Presioná el botón de la izquierda para ejecutar el modelo.")
+    st.markdown(
+        """
+        ### ¿Qué hace esta aplicación?
+        Esta herramienta descarga datos públicos de EIA, entrena un modelo supervisado para clasificar la dirección del precio internacional de referencia y permite contrastar el resultado con compras reales de importación Recope.
+
+        **Flujo de lectura recomendado:**
+        1. Predicción EIA: resultado del modelo y probabilidad de subida.
+        2. Compras Recope: comportamiento real de importaciones.
+        3. Comparación: cercanía entre proxy internacional y compra real.
+        4. Análisis técnico: interpretación de errores, brechas y desempeño.
+        5. Histórico: tablas y descargas para revisión.
+        """
+    )
+    pie_autor()
